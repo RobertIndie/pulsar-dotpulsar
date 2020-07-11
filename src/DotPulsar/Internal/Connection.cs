@@ -18,7 +18,6 @@ namespace DotPulsar.Internal
     using Exceptions;
     using Extensions;
     using PulsarApi;
-    using System;
     using System.Threading;
     using System.Threading.Tasks;
 
@@ -170,12 +169,6 @@ namespace DotPulsar.Internal
         public async Task<BaseCommand> Send(SendPackage command, CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
-
-            if (command.Command is null)
-                throw new ArgumentNullException(nameof(command.Command));
-
-            if (command.Metadata is null)
-                throw new ArgumentNullException(nameof(command.Metadata));
 
             Task<BaseCommand>? response;
 

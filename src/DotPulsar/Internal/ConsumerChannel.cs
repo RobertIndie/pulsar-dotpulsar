@@ -28,7 +28,6 @@ namespace DotPulsar.Internal
         private readonly IConnection _connection;
         private readonly BatchHandler _batchHandler;
         private readonly CommandFlow _cachedCommandFlow;
-        private readonly AsyncLock _lock;
         private uint _sendWhenZero;
         private bool _firstFlow;
 
@@ -44,8 +43,6 @@ namespace DotPulsar.Internal
             _connection = connection;
             _batchHandler = batchHandler;
 
-            _lock = new AsyncLock();
-
             _cachedCommandFlow = new CommandFlow
             {
                 ConsumerId = id,
@@ -58,38 +55,35 @@ namespace DotPulsar.Internal
 
         public async ValueTask<Message> Receive(CancellationToken cancellationToken)
         {
-            using (await _lock.Lock(cancellationToken).ConfigureAwait(false))
+            while (true)
             {
-                while (true)
+                if (_sendWhenZero == 0)
+                    await SendFlow(cancellationToken).ConfigureAwait(false);
+
+                _sendWhenZero--;
+
+                var message = _batchHandler.GetNext();
+
+                if (message != null)
+                    return message;
+
+                var messagePackage = await _queue.Dequeue(cancellationToken).ConfigureAwait(false);
+
+                if (!messagePackage.IsValid())
                 {
-                    if (_sendWhenZero == 0)
-                        await SendFlow(cancellationToken).ConfigureAwait(false);
-
-                    _sendWhenZero--;
-
-                    var message = _batchHandler.GetNext();
-
-                    if (message != null)
-                        return message;
-
-                    var messagePackage = await _queue.Dequeue(cancellationToken).ConfigureAwait(false);
-
-                    if (!messagePackage.IsValid())
-                    {
-                        await RejectPackage(messagePackage, cancellationToken).ConfigureAwait(false);
-                        continue;
-                    }
-
-                    var metadataSize = messagePackage.GetMetadataSize();
-                    var redeliveryCount = messagePackage.RedeliveryCount;
-                    var data = messagePackage.ExtractData(metadataSize);
-                    var metadata = messagePackage.ExtractMetadata(metadataSize);
-                    var messageId = messagePackage.MessageId;
-
-                    return metadata.NumMessagesInBatch == 1
-                        ? new Message(new MessageId(messageId), redeliveryCount, metadata, null, data)
-                        : _batchHandler.Add(messageId, redeliveryCount, metadata, data);
+                    await RejectPackage(messagePackage, cancellationToken).ConfigureAwait(false);
+                    continue;
                 }
+
+                var metadataSize = messagePackage.GetMetadataSize();
+                var redeliveryCount = messagePackage.RedeliveryCount;
+                var data = messagePackage.ExtractData(metadataSize);
+                var metadata = messagePackage.ExtractMetadata(metadataSize);
+                var messageId = messagePackage.MessageId;
+
+                return metadata.NumMessagesInBatch == 1
+                    ? new Message(new MessageId(messageId), redeliveryCount, metadata, null, data)
+                    : _batchHandler.Add(messageId, redeliveryCount, metadata, data);
             }
         }
 
@@ -147,9 +141,8 @@ namespace DotPulsar.Internal
             try
             {
                 _queue.Dispose();
-                await _lock.DisposeAsync();
-                var closeConsumer = new CommandCloseConsumer { ConsumerId = _id };
-                await _connection.Send(closeConsumer, CancellationToken.None).ConfigureAwait(false);
+
+                await _connection.Send(new CommandCloseConsumer { ConsumerId = _id }, CancellationToken.None).ConfigureAwait(false);
             }
             catch
             {
