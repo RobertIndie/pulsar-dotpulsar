@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -90,15 +90,17 @@ namespace DotPulsar.Internal
 
                 if (autoAssignSequenceId)
                 {
-                    var newSequenceId = _sequenceId.FetchNext();
-                    sendPackage.Command.SequenceId = newSequenceId;
-                    sendPackage.Metadata.SequenceId = newSequenceId;
+                    sendPackage.Command.SequenceId = _sequenceId.Current;
+                    sendPackage.Metadata.SequenceId = _sequenceId.Current;
                 }
                 else
                     sendPackage.Command.SequenceId = sendPackage.Metadata.SequenceId;
 
                 var response = await _connection.Send(sendPackage, cancellationToken).ConfigureAwait(false);
                 response.Expect(BaseCommand.Type.SendReceipt);
+
+                if (autoAssignSequenceId)
+                    _sequenceId.Increment();
 
                 return response.SendReceipt;
             }
@@ -113,4 +115,3 @@ namespace DotPulsar.Internal
         }
     }
 }
-
