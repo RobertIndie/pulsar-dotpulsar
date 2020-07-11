@@ -23,12 +23,12 @@ namespace DotPulsar.Internal
         private const string ConnectResponseIdentifier = "Connected";
 
         private readonly Awaiter<string, BaseCommand> _responses;
-        private RequestId _requestId;
+        private SequenceId _requestId;
 
         public RequestResponseHandler()
         {
             _responses = new Awaiter<string, BaseCommand>();
-            _requestId = new RequestId();
+            _requestId = new SequenceId(1);
         }
 
         public void Dispose()
