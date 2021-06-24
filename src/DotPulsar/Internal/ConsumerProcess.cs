@@ -15,7 +15,10 @@
 namespace DotPulsar.Internal
 {
     using Abstractions;
+    using Events;
     using System;
+    using System.Collections.Concurrent;
+    using System.Threading;
     using System.Threading.Tasks;
 
     public sealed class ConsumerProcess : Process
@@ -23,16 +26,22 @@ namespace DotPulsar.Internal
         private readonly IStateManager<ConsumerState> _stateManager;
         private readonly IEstablishNewChannel _consumer;
         private readonly bool _isFailoverSubscription;
+        private readonly ConcurrentDictionary<int, ConsumerProcess> _subConsumers;
+        private readonly Guid? _parentConsumerId;
 
         public ConsumerProcess(
             Guid correlationId,
             IStateManager<ConsumerState> stateManager,
             IEstablishNewChannel consumer,
-            bool isFailoverSubscription) : base(correlationId)
+            bool isFailoverSubscription,
+            Guid? parentConsumerId = null) : base(correlationId)
         {
             _stateManager = stateManager;
             _consumer = consumer;
             _isFailoverSubscription = isFailoverSubscription;
+            _parentConsumerId = parentConsumerId;
+
+            _subConsumers = new ConcurrentDictionary<int, ConsumerProcess>();
         }
 
         public override async ValueTask DisposeAsync()
@@ -42,10 +51,62 @@ namespace DotPulsar.Internal
             await _consumer.DisposeAsync().ConfigureAwait(false);
         }
 
+        private void OnSubConsumersStateChanged(ConsumerStateChanged stateChanged, CancellationToken cancellationToken)
+            => CalculateState();
+
+        protected override void HandleExtend(IEvent e)
+        {
+            switch (e)
+            {
+                case AddSubConsumer addSubConsumer:
+                    _subConsumers[addSubConsumer.PartitionId] = addSubConsumer.ConsumerProcess;
+
+                    _ = StateMonitor.MonitorConsumer(addSubConsumer.Consumer,
+                        new ActionStateChangedHandler<ConsumerStateChanged>(OnSubConsumersStateChanged, CancellationTokenSource.Token));
+                    break;
+            }
+        }
+
         protected override void CalculateState()
         {
             if (_stateManager.IsFinalState())
                 return;
+
+            if (!_parentConsumerId.HasValue)
+            {
+                var activeCount = 0;
+
+                foreach (var consumer in _subConsumers)
+                {
+                    switch (consumer.Value._stateManager.CurrentState)
+                    {
+                        case ConsumerState.Active:
+                            activeCount++;
+                            break;
+                        case ConsumerState.Unsubscribed:
+                            _stateManager.SetState(ConsumerState.Unsubscribed);
+                            break;
+                        case ConsumerState.Closed:
+                            _stateManager.SetState(ConsumerState.Closed);
+                            break;
+                        case ConsumerState.Faulted:
+                            _stateManager.SetState(ConsumerState.Faulted);
+                            break;
+                        case ConsumerState.ReachedEndOfTopic:
+                            _stateManager.SetState(ConsumerState.ReachedEndOfTopic);
+                            break;
+                    }
+                }
+
+                if (activeCount == 0)
+                    _stateManager.SetState(ConsumerState.Disconnected);
+                else if (activeCount < _subConsumers.Count)
+                    _stateManager.SetState(ConsumerState.PartiallyActive);
+                else
+                    _stateManager.SetState(ConsumerState.Active);
+
+                return;
+            }
 
             if (ExecutorState == ExecutorState.Faulted)
             {
