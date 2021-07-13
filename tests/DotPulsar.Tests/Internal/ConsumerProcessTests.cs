@@ -42,8 +42,8 @@ namespace DotPulsar.Tests.Internal
             var partitionedStateManager = new StateManager<ConsumerState>(ConsumerState.Disconnected, ConsumerState.Closed, ConsumerState.ReachedEndOfTopic, ConsumerState.Faulted);
             var consumerProcess = new ConsumerProcess(parentConsumerGuid, partitionedStateManager, establishNewChannel, false);
             processManager.Add(consumerProcess);
-            var consumer = new Consumer<string>(parentConsumerGuid, new Uri("pulsar://localhost:6650"), "", "", processManager, Substitute.For<IConsumerChannel<string>>(),
-                Substitute.For<IExecute>(), partitionedStateManager, Substitute.For<IConsumerChannelFactory<string>>());
+            var consumer = new Consumer<string>(parentConsumerGuid, new Uri("pulsar://localhost:6650"), "", "", processManager,
+                Substitute.For<IExecute>(), partitionedStateManager, Substitute.For<ConsumerOptions<string>>(), Substitute.For<PulsarClient>());
 
             for (var i = 0; i < 3; i++)
             {

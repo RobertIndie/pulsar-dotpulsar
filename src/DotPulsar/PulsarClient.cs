@@ -20,6 +20,7 @@ namespace DotPulsar
     using Exceptions;
     using Internal;
     using Internal.Abstractions;
+    using Internal.Extensions;
     using System;
     using System.Linq;
     using System.Threading;
@@ -57,6 +58,20 @@ namespace DotPulsar
         public static IPulsarClientBuilder Builder()
             => new PulsarClientBuilder();
 
+        internal async Task<uint> GetNumberOfPartitions(string topic, CancellationToken cancellationToken)
+        {
+            var connection = await _connectionPool.FindConnectionForTopic(topic, cancellationToken).ConfigureAwait(false);
+            var commandPartitionedMetadata = new CommandPartitionedTopicMetadata() { Topic = topic };
+            var response = await connection.Send(commandPartitionedMetadata, cancellationToken).ConfigureAwait(false);
+
+            response.Expect(BaseCommand.Type.PartitionedMetadataResponse);
+
+            if (response.PartitionMetadataResponse.Response == CommandPartitionedTopicMetadataResponse.LookupType.Failed)
+                response.PartitionMetadataResponse.Throw();
+
+            return response.PartitionMetadataResponse.Partitions;
+        }
+
         /// <summary>
         /// Create a producer.
         /// </summary>
@@ -64,7 +79,34 @@ namespace DotPulsar
         {
             ThrowIfDisposed();
 
+            var correlationId = Guid.NewGuid();
+            var executor = new Executor(correlationId, _processManager, _exceptionHandler);
+            var stateManager = new StateManager<ProducerState>(ProducerState.Disconnected, ProducerState.Closed, ProducerState.Faulted);
+
+            var producer = new Producer<TMessage>(correlationId, ServiceUrl, options.Topic, _processManager, executor, stateManager, options, this);
+
+            if (options.StateChangedHandler is not null)
+                _ = StateMonitor.MonitorProducer(producer, options.StateChangedHandler);
+            var process = new ProducerProcess(correlationId, stateManager, producer, _processManager);
+            _processManager.Add(process);
+            process.Start();
+            return producer;
+        }
+
+        /// <summary>
+        /// Create a producer internally.
+        /// This method is used to create internal producers for partitioned producer.
+        /// </summary>
+        internal SubProducer<TMessage> NewSubProducer<TMessage>(string topic, ProducerOptions<TMessage> options, IExecute executor, Guid partitionedProducerGuid,
+            uint? partitionIndex = null)
+        {
+            ThrowIfDisposed();
+
             ICompressorFactory? compressorFactory = null;
+
+            if (partitionIndex.HasValue)
+                topic = $"{topic}-partition-{partitionIndex}";
+
             if (options.CompressionType != CompressionType.None)
             {
                 var compressionType = (Internal.PulsarApi.CompressionType) options.CompressionType;
@@ -74,11 +116,22 @@ namespace DotPulsar
                     throw new CompressionException($"Support for {compressionType} compression was not found");
             }
 
-            var producer = new Producer<TMessage>(ServiceUrl, options, _processManager, _exceptionHandler, _connectionPool, compressorFactory);
+            var correlationId = Guid.NewGuid();
 
-            if (options.StateChangedHandler is not null)
+            var producerName = options.ProducerName;
+            var schema = options.Schema;
+            var initialSequenceId = options.InitialSequenceId;
+
+            var factory = new ProducerChannelFactory(correlationId, _processManager, _connectionPool, topic, producerName, schema.SchemaInfo, compressorFactory);
+            var stateManager = new StateManager<ProducerState>(ProducerState.Disconnected, ProducerState.Closed, ProducerState.Faulted);
+            var initialChannel = new NotReadyChannel<TMessage>();
+            var producer = new SubProducer<TMessage>(correlationId, ServiceUrl, topic, initialSequenceId, _processManager, initialChannel, executor, stateManager, factory, schema);
+
+            if (options.StateChangedHandler is not null && !partitionIndex.HasValue) // the StateChangeHandler of the sub producers in partitioned producers should be disabled.
                 _ = StateMonitor.MonitorProducer(producer, options.StateChangedHandler);
-
+            var process = new ProducerProcess(correlationId, stateManager, producer, _processManager, partitionedProducerGuid);
+            _processManager.Add(process);
+            process.Start();
             return producer;
         }
 
@@ -90,15 +143,40 @@ namespace DotPulsar
             ThrowIfDisposed();
 
             var correlationId = Guid.NewGuid();
-            var consumerName = options.ConsumerName ?? $"Consumer-{correlationId:N}";
+            var executor = new Executor(correlationId, _processManager, _exceptionHandler);
+            var stateManager = new StateManager<ConsumerState>(ConsumerState.Disconnected, ConsumerState.Closed, ConsumerState.ReachedEndOfTopic, ConsumerState.Faulted);
+
+            var consumer = new Consumer<TMessage>(correlationId, ServiceUrl, options.SubscriptionName, options.Topic, _processManager, executor, stateManager, options, this);
+
+            if (options.StateChangedHandler is not null)
+                _ = StateMonitor.MonitorConsumer(consumer, options.StateChangedHandler);
+            var process = new ConsumerProcess(correlationId, stateManager, consumer, options.SubscriptionType == SubscriptionType.Failover);
+            _processManager.Add(process);
+            process.Start();
+            return consumer;
+        }
+
+        /// <summary>
+        ///
+        /// </summary>
+        internal IConsumer<TMessage> NewSubConsumer<TMessage>(string topic, ConsumerOptions<TMessage> options, IExecute executor, Guid partitionedProducerGuid,
+            uint? partitionIndex = null)
+        {
+            ThrowIfDisposed();
+
+            if (partitionIndex.HasValue)
+                topic = $"{topic}-partition-{partitionIndex}";
+
+            var correlationId = Guid.NewGuid();
+            // var executor = new Executor(correlationId, _processManager, _exceptionHandler);
             var subscribe = new CommandSubscribe
             {
-                ConsumerName = consumerName,
+                ConsumerName = options.ConsumerName,
                 InitialPosition = (CommandSubscribe.InitialPositionType) options.InitialPosition,
                 PriorityLevel = options.PriorityLevel,
                 ReadCompacted = options.ReadCompacted,
                 Subscription = options.SubscriptionName,
-                Topic = options.Topic,
+                Topic = topic,
                 Type = (CommandSubscribe.SubType) options.SubscriptionType
             };
             var messagePrefetchCount = options.MessagePrefetchCount;
@@ -108,11 +186,8 @@ namespace DotPulsar
             var factory = new ConsumerChannelFactory<TMessage>(correlationId, _processManager, _connectionPool, subscribe, messagePrefetchCount, batchHandler, messageFactory, decompressorFactories);
             var stateManager = new StateManager<ConsumerState>(ConsumerState.Disconnected, ConsumerState.Closed, ConsumerState.ReachedEndOfTopic, ConsumerState.Faulted);
             var initialChannel = new NotReadyChannel<TMessage>();
-            var executor = new Executor(correlationId, _processManager, _exceptionHandler);
-            var consumer = new Consumer<TMessage>(correlationId, ServiceUrl, options.SubscriptionName, options.Topic, _processManager, initialChannel, executor, stateManager, factory);
-            if (options.StateChangedHandler is not null)
-                _ = StateMonitor.MonitorConsumer(consumer, options.StateChangedHandler);
-            var process = new ConsumerProcess(correlationId, stateManager, consumer, options.SubscriptionType == SubscriptionType.Failover);
+            var consumer = new SubConsumer<TMessage>(correlationId, ServiceUrl, options.SubscriptionName, topic, _processManager, initialChannel, executor, stateManager, factory);
+            var process = new ConsumerProcess(correlationId, stateManager, consumer, options.SubscriptionType == SubscriptionType.Failover, partitionedProducerGuid);
             _processManager.Add(process);
             process.Start();
             return consumer;
@@ -126,14 +201,14 @@ namespace DotPulsar
             ThrowIfDisposed();
 
             var correlationId = Guid.NewGuid();
-            var subscription = $"Reader-{correlationId:N}";
+            var executor = new Executor(correlationId, _processManager, _exceptionHandler);
             var subscribe = new CommandSubscribe
             {
-                ConsumerName = options.ReaderName ?? subscription,
+                ConsumerName = options.ReaderName,
                 Durable = false,
                 ReadCompacted = options.ReadCompacted,
                 StartMessageId = options.StartMessageId.ToMessageIdData(),
-                Subscription = subscription,
+                Subscription = $"Reader-{Guid.NewGuid():N}",
                 Topic = options.Topic
             };
             var messagePrefetchCount = options.MessagePrefetchCount;
@@ -143,7 +218,6 @@ namespace DotPulsar
             var factory = new ConsumerChannelFactory<TMessage>(correlationId, _processManager, _connectionPool, subscribe, messagePrefetchCount, batchHandler, messageFactory, decompressorFactories);
             var stateManager = new StateManager<ReaderState>(ReaderState.Disconnected, ReaderState.Closed, ReaderState.ReachedEndOfTopic, ReaderState.Faulted);
             var initialChannel = new NotReadyChannel<TMessage>();
-            var executor = new Executor(correlationId, _processManager, _exceptionHandler);
             var reader = new Reader<TMessage>(correlationId, ServiceUrl, options.Topic, _processManager, initialChannel, executor, stateManager, factory);
             if (options.StateChangedHandler is not null)
                 _ = StateMonitor.MonitorReader(reader, options.StateChangedHandler);
