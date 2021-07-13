@@ -21,7 +21,7 @@ namespace DotPulsar
     /// <summary>
     /// Unique identifier of a single message.
     /// </summary>
-    public sealed class MessageId : IEquatable<MessageId>, IComparable<MessageId>
+    public class MessageId : IEquatable<MessageId>, IComparable<MessageId>
     {
         static MessageId()
         {
@@ -70,7 +70,7 @@ namespace DotPulsar
         /// </summary>
         public int BatchIndex { get; }
 
-        public int CompareTo(MessageId? other)
+        public virtual int CompareTo(MessageId? other)
         {
             if (other is null)
                 return 1;

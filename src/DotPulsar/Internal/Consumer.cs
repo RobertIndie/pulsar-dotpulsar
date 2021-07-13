@@ -16,12 +16,9 @@ namespace DotPulsar.Internal
 {
     using Abstractions;
     using DotPulsar.Abstractions;
-    using DotPulsar.Exceptions;
-    using DotPulsar.Internal.Extensions;
     using Events;
-    using Microsoft.Extensions.ObjectPool;
-    using PulsarApi;
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Linq;
     using System.Threading;
@@ -31,11 +28,13 @@ namespace DotPulsar.Internal
     {
         private readonly Guid _correlationId;
         private readonly IRegisterEvent _eventRegister;
-        private IConsumerChannel<TMessage> _channel;
-        private readonly ObjectPool<CommandAck> _commandAckPool;
         private readonly IExecute _executor;
         private readonly IStateChanged<ConsumerState> _state;
-        private readonly IConsumerChannelFactory<TMessage> _factory;
+        private readonly ConsumerOptions<TMessage> _options;
+        private readonly PulsarClient _pulsarClient;
+        private readonly ConcurrentDictionary<int, IConsumer<TMessage>> _consumers;
+        private readonly CancellationTokenSource _cts = new();
+        private int _consumersCount;
         private int _isDisposed;
 
         public Uri ServiceUrl { get; }
@@ -48,31 +47,109 @@ namespace DotPulsar.Internal
             string subscriptionName,
             string topic,
             IRegisterEvent eventRegister,
-            IConsumerChannel<TMessage> initialChannel,
             IExecute executor,
             IStateChanged<ConsumerState> state,
-            IConsumerChannelFactory<TMessage> factory)
+            ConsumerOptions<TMessage> options,
+            PulsarClient pulsarClient)
         {
             _correlationId = correlationId;
             ServiceUrl = serviceUrl;
             SubscriptionName = subscriptionName;
             Topic = topic;
             _eventRegister = eventRegister;
-            _channel = initialChannel;
             _executor = executor;
             _state = state;
-            _factory = factory;
-            _commandAckPool = new DefaultObjectPool<CommandAck>(new DefaultPooledObjectPolicy<CommandAck>());
+            _options = options;
+            _pulsarClient = pulsarClient;
             _isDisposed = 0;
 
-            _eventRegister.Register(new ConsumerCreated(_correlationId));
+            _consumers = new ConcurrentDictionary<int, IConsumer<TMessage>>(1, 31);
         }
 
-        public async ValueTask<ConsumerState> OnStateChangeTo(ConsumerState state, CancellationToken cancellationToken)
-            => await _state.StateChangedTo(state, cancellationToken).ConfigureAwait(false);
+        private void CreateSubConsumers(int startIndex, int count)
+        {
+            if (count == 0)
+            {
+                var consumer = _pulsarClient.NewSubConsumer(Topic, _options, _executor, _correlationId);
+                _consumers[0] = consumer;
+                return;
+            }
 
-        public async ValueTask<ConsumerState> OnStateChangeFrom(ConsumerState state, CancellationToken cancellationToken)
-            => await _state.StateChangedFrom(state, cancellationToken).ConfigureAwait(false);
+            for (var i = startIndex; i < count; ++i)
+            {
+                var consumer = _pulsarClient.NewSubConsumer(Topic, _options, _executor, _correlationId, (uint) i);
+                _consumers[i] = consumer;
+            }
+        }
+
+        private async void UpdatePartitions(CancellationToken cancellationToken)
+        {
+            var partitionsCount = (int) await _pulsarClient.GetNumberOfPartitions(Topic, cancellationToken).ConfigureAwait(false);
+            _eventRegister.Register(new UpdatePartitions(_correlationId, (uint) partitionsCount));
+            CreateSubConsumers(_consumers.Count, partitionsCount);
+            _consumersCount = partitionsCount;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _isDisposed, 1) != 0)
+                return;
+
+            _cts.Cancel();
+            _cts.Dispose();
+
+            foreach (var consumer in _consumers.Values)
+            {
+                await consumer.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        public async Task EstablishNewChannel(CancellationToken cancellationToken)
+        {
+            await _executor.Execute(() => UpdatePartitions(cancellationToken), cancellationToken).ConfigureAwait(false);
+        }
+
+        public ValueTask<MessageId> GetLastMessageId(CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        private static bool IsIllegalMultiTopicsMessageId(MessageId messageId)
+        {
+            //only support earliest/latest
+            return !MessageId.Earliest.Equals(messageId) && !MessageId.Latest.Equals(messageId);
+        }
+
+        public async ValueTask Seek(MessageId messageId, CancellationToken cancellationToken = default)
+            => await _executor.Execute(() =>
+            {
+                var tasks = new List<Task>();
+
+                if (messageId == null || IsIllegalMultiTopicsMessageId(messageId))
+                {
+                    throw new ArgumentException("Illegal messageId, messageId can only be earliest/latest.");
+                }
+
+                _consumers.Values.ToList().ForEach(consumer =>
+                {
+                    var task = consumer.Seek(messageId, cancellationToken).AsTask();
+                    task.ConfigureAwait(false);
+                    tasks.Add(task);
+                });
+                Task.WaitAll(tasks.ToArray());
+            }, cancellationToken).ConfigureAwait(false);
+
+        public async ValueTask Seek(ulong publishTime, CancellationToken cancellationToken = default)
+            => await _executor.Execute(() =>
+            {
+                var tasks = new List<Task>();
+
+                _consumers.Values.ToList().ForEach(consumer =>
+                {
+                    var task = consumer.Seek(publishTime, cancellationToken).AsTask();
+                    task.ConfigureAwait(false);
+                    tasks.Add(task);
+                });
+                Task.WaitAll(tasks.ToArray());
+            }, cancellationToken).ConfigureAwait(false);
 
         public bool IsFinalState()
             => _state.IsFinalState();
@@ -80,127 +157,61 @@ namespace DotPulsar.Internal
         public bool IsFinalState(ConsumerState state)
             => _state.IsFinalState(state);
 
-        public async ValueTask DisposeAsync()
-        {
-            if (Interlocked.Exchange(ref _isDisposed, 1) != 0)
-                return;
+        public async ValueTask<ConsumerState> OnStateChangeTo(ConsumerState state, CancellationToken cancellationToken)
+            => await _state.StateChangedTo(state, cancellationToken).ConfigureAwait(false);
 
-            _eventRegister.Register(new ConsumerDisposed(_correlationId));
-            await _channel.ClosedByClient(CancellationToken.None).ConfigureAwait(false);
-            await _channel.DisposeAsync().ConfigureAwait(false);
-        }
+        public async ValueTask<ConsumerState> OnStateChangeFrom(ConsumerState state, CancellationToken cancellationToken)
+            => await _state.StateChangedFrom(state, cancellationToken).ConfigureAwait(false);
 
-        public async ValueTask<IMessage<TMessage>> Receive(CancellationToken cancellationToken)
-        {
-            ThrowIfDisposed();
+        public async ValueTask Acknowledge(MessageId messageId, CancellationToken cancellationToken = default)
+            => await _executor.Execute((() => _consumers[messageId.Partition].Acknowledge(messageId, cancellationToken)), cancellationToken).ConfigureAwait(false);
 
-            return await _executor.Execute(() => ReceiveMessage(cancellationToken), cancellationToken).ConfigureAwait(false);
-        }
+        public async ValueTask AcknowledgeCumulative(MessageId messageId, CancellationToken cancellationToken = default)
+            => await _executor.Execute((() => _consumers[messageId.Partition].AcknowledgeCumulative(messageId, cancellationToken)), cancellationToken).ConfigureAwait(false);
 
-        private async ValueTask<IMessage<TMessage>> ReceiveMessage(CancellationToken cancellationToken)
-            => await _channel.Receive(cancellationToken).ConfigureAwait(false);
-
-        public async ValueTask Acknowledge(MessageId messageId, CancellationToken cancellationToken)
-            => await Acknowledge(messageId, CommandAck.AckType.Individual, cancellationToken).ConfigureAwait(false);
-
-        public async ValueTask AcknowledgeCumulative(MessageId messageId, CancellationToken cancellationToken)
-            => await Acknowledge(messageId, CommandAck.AckType.Cumulative, cancellationToken).ConfigureAwait(false);
-
-        public async ValueTask RedeliverUnacknowledgedMessages(IEnumerable<MessageId> messageIds, CancellationToken cancellationToken)
-        {
-            ThrowIfDisposed();
-
-            var command = new CommandRedeliverUnacknowledgedMessages();
-            command.MessageIds.AddRange(messageIds.Select(messageId => messageId.ToMessageIdData()));
-            await _executor.Execute(() => RedeliverUnacknowledgedMessages(command, cancellationToken), cancellationToken).ConfigureAwait(false);
-        }
-
-        public async ValueTask RedeliverUnacknowledgedMessages(CancellationToken cancellationToken)
-            => await RedeliverUnacknowledgedMessages(Enumerable.Empty<MessageId>(), cancellationToken).ConfigureAwait(false);
-
-        public async ValueTask Unsubscribe(CancellationToken cancellationToken)
-        {
-            ThrowIfDisposed();
-
-            var unsubscribe = new CommandUnsubscribe();
-            await _executor.Execute(() => Unsubscribe(unsubscribe, cancellationToken), cancellationToken).ConfigureAwait(false);
-        }
-
-        private async ValueTask Unsubscribe(CommandUnsubscribe command, CancellationToken cancellationToken)
-            =>await _channel.Send(command, cancellationToken).ConfigureAwait(false);
-
-        public async ValueTask Seek(MessageId messageId, CancellationToken cancellationToken)
-        {
-            ThrowIfDisposed();
-
-            var seek = new CommandSeek { MessageId = messageId.ToMessageIdData() };
-            await _executor.Execute(() => Seek(seek, cancellationToken), cancellationToken).ConfigureAwait(false);
-        }
-
-        public async ValueTask Seek(ulong publishTime, CancellationToken cancellationToken)
-        {
-            ThrowIfDisposed();
-
-            var seek = new CommandSeek { MessagePublishTime = publishTime };
-            await _executor.Execute(() => Seek(seek, cancellationToken), cancellationToken).ConfigureAwait(false);
-        }
-
-        public async ValueTask<MessageId> GetLastMessageId(CancellationToken cancellationToken)
-        {
-            ThrowIfDisposed();
-
-            var getLastMessageId = new CommandGetLastMessageId();
-            return await _executor.Execute(() => GetLastMessageId(getLastMessageId, cancellationToken), cancellationToken).ConfigureAwait(false);
-        }
-
-        private async ValueTask<MessageId> GetLastMessageId(CommandGetLastMessageId command, CancellationToken cancellationToken)
-            => await _channel.Send(command, cancellationToken).ConfigureAwait(false);
-
-        private async Task Seek(CommandSeek command, CancellationToken cancellationToken)
-            => await _channel.Send(command, cancellationToken).ConfigureAwait(false);
-
-        private async ValueTask Acknowledge(MessageId messageId, CommandAck.AckType ackType, CancellationToken cancellationToken)
-        {
-            ThrowIfDisposed();
-
-            var commandAck = _commandAckPool.Get();
-            commandAck.Type = ackType;
-            if (commandAck.MessageIds.Count == 0)
-                commandAck.MessageIds.Add(messageId.ToMessageIdData());
-            else
-                commandAck.MessageIds[0].MapFrom(messageId);
-
-            try
+        public async ValueTask Unsubscribe(CancellationToken cancellationToken = default)
+            => await _executor.Execute(() =>
             {
-                await _executor.Execute(() => Acknowledge(commandAck, cancellationToken), cancellationToken).ConfigureAwait(false);
-            }
-            finally
+                var tasks = new List<Task>();
+
+                _consumers.Values.ToList().ForEach(consumer =>
+                {
+                    var task = consumer.Unsubscribe(cancellationToken).AsTask();
+                    task.ConfigureAwait(false);
+                    tasks.Add(task);
+                });
+                Task.WaitAll(tasks.ToArray());
+            }, cancellationToken).ConfigureAwait(false);
+
+        public async ValueTask RedeliverUnacknowledgedMessages(IEnumerable<MessageId> messageIds, CancellationToken cancellationToken = default)
+            => await _executor.Execute(() =>
             {
-                _commandAckPool.Return(commandAck);
-            }
-        }
+                var tasks = new List<Task>();
 
-        private async ValueTask Acknowledge(CommandAck command, CancellationToken cancellationToken)
-            => await _channel.Send(command, cancellationToken).ConfigureAwait(false);
+                messageIds.ToList().GroupBy()ForEach(messageId =>
+                {
+                    var task = _consumers[messageId.Partition].RedeliverUnacknowledgedMessages(cancellationToken).AsTask();
+                    task.ConfigureAwait(false);
+                    tasks.Add(task);
+                });
+                Task.WaitAll(tasks.ToArray());
+            }, cancellationToken).ConfigureAwait(false);
 
-        private async ValueTask RedeliverUnacknowledgedMessages(CommandRedeliverUnacknowledgedMessages command, CancellationToken cancellationToken)
-            => await _channel.Send(command, cancellationToken).ConfigureAwait(false);
+        public ValueTask RedeliverUnacknowledgedMessages(CancellationToken cancellationToken = default)
+            => await _executor.Execute(() =>
+            {
+                var tasks = new List<Task>();
 
-        private void ThrowIfDisposed()
-        {
-            if (_isDisposed != 0)
-                throw new ConsumerDisposedException(GetType().FullName!);
-        }
+                _consumers.Values.ToList().ForEach(consumer =>
+                {
+                    var task = consumer.RedeliverUnacknowledgedMessages(cancellationToken).AsTask();
+                    task.ConfigureAwait(false);
+                    tasks.Add(task);
+                });
+                Task.WaitAll(tasks.ToArray());
+            }, cancellationToken).ConfigureAwait(false);
 
-        public async Task EstablishNewChannel(CancellationToken cancellationToken)
-        {
-            var channel = await _executor.Execute(() => _factory.Create(cancellationToken), cancellationToken).ConfigureAwait(false);
-
-            var oldChannel = _channel;
-            _channel = channel;
-
-            if (oldChannel is not null)
-                await oldChannel.DisposeAsync().ConfigureAwait(false);
-        }
+        public ValueTask<IMessage<TMessage>> Receive(CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
     }
 }
