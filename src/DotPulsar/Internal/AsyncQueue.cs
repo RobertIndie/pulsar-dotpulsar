@@ -47,6 +47,7 @@ public sealed class AsyncQueue<T> : IEnqueue<T>, IDequeue<T>, IDisposable
             }
             else
                 _queue.Enqueue(item);
+            Console.WriteLine($"AsyncQueue: Enqueue. count: {_queue.Count}");
         }
 
         node?.Value.Dispose();
@@ -56,6 +57,7 @@ public sealed class AsyncQueue<T> : IEnqueue<T>, IDequeue<T>, IDisposable
     {
         LinkedListNode<CancelableCompletionSource<T>>? node = null;
 
+        Console.WriteLine($"AsyncQueue: Try dequeue: queue count: {_queue.Count}");
         lock (_lock)
         {
             ThrowIfDisposed();

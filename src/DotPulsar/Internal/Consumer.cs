@@ -228,6 +228,8 @@ public sealed class Consumer<TMessage> : IConsumer<TMessage>
                     receiveTaskNode = receiveTaskNode.Next;
                 }
 
+                Console.WriteLine($"Waiting for {_numberOfSubConsumers} consumers");
+
                 for (var i = 0; i < _numberOfSubConsumers; ++i)
                 {
                     if (!_receiveEnumerator.MoveNext())
@@ -237,8 +239,10 @@ public sealed class Consumer<TMessage> : IConsumer<TMessage>
                     }
 
                     var subConsumer = _receiveEnumerator.Current.Value;
+                    Console.WriteLine($"Waiting for consumer {i} of {_numberOfSubConsumers}");
 
                     var receiveTask = subConsumer.Receive(_cts.Token);
+                    Console.WriteLine($"Receiving message {i} of {_numberOfSubConsumers}: {receiveTask.IsCompleted} | {receiveTask.IsFaulted}");
                     if (receiveTask.IsCompleted)
                         return receiveTask.Result;
 

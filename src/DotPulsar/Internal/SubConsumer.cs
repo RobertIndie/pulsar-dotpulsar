@@ -184,6 +184,7 @@ public sealed class SubConsumer<TMessage> : IConsumer<TMessage>, IContainsChanne
 
     private async ValueTask<IMessage<TMessage>> InternalReceive(CancellationToken cancellationToken)
     {
+        Console.WriteLine($"SubConsumer Start receiving messages...");
         Guard();
         return await _channel.Receive(cancellationToken).ConfigureAwait(false);
     }

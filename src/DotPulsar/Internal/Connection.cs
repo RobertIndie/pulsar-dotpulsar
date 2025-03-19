@@ -66,6 +66,7 @@ public sealed class Connection : IConnection
     public async Task<ProducerResponse> Send(CommandProducer command, IChannel channel, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandProducer: Topic: {command.Topic}, ProducerName: {command.ProducerName}, RequestId: {command.RequestId}");
 
         Task<ProducerResponse>? responseTask;
 
@@ -82,6 +83,7 @@ public sealed class Connection : IConnection
     public async Task<SubscribeResponse> Send(CommandSubscribe command, IChannel channel, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandSubscribe: Topic: {command.Topic}, Subscription: {command.Subscription}, RequestId: {command.RequestId}");
 
         Task<SubscribeResponse>? responseTask;
 
@@ -108,23 +110,37 @@ public sealed class Connection : IConnection
     }
 
     public Task Send(CommandPing command, CancellationToken cancellationToken)
-        => Send(command.AsBaseCommand(), cancellationToken);
+    {
+        return Send(command.AsBaseCommand(), cancellationToken);
+    }
 
     public Task Send(CommandPong command, CancellationToken cancellationToken)
-        => Send(command.AsBaseCommand(), cancellationToken);
+    {
+        return Send(command.AsBaseCommand(), cancellationToken);
+    }
 
     public Task Send(CommandAck command, CancellationToken cancellationToken)
-        => Send(command.AsBaseCommand(), cancellationToken);
+    {
+        Console.WriteLine($"Connection send CommandAck: ConsumerId: {command.ConsumerId}, RequestId: {command.RequestId}");
+        return Send(command.AsBaseCommand(), cancellationToken);
+    }
 
     public Task Send(CommandFlow command, CancellationToken cancellationToken)
-        => Send(command.AsBaseCommand(), cancellationToken);
+    {
+        Console.WriteLine($"Connection send CommandFlow: ConsumerId: {command.ConsumerId}, MessagePermits: {command.MessagePermits}, RequestId: {command.MessagePermits}");
+        return Send(command.AsBaseCommand(), cancellationToken);
+    }
 
     public Task Send(CommandRedeliverUnacknowledgedMessages command, CancellationToken cancellationToken)
-        => Send(command.AsBaseCommand(), cancellationToken);
+    {
+        Console.WriteLine($"Connection send CommandRedeliverUnacknowledgedMessages:  ConsumerId: {command.ConsumerId}, RequestId: {command.MessageIds}");
+        return Send(command.AsBaseCommand(), cancellationToken);
+    }
 
     public async Task<BaseCommand> Send(CommandUnsubscribe command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandUnsubscribe: ConsumerId: {command.ConsumerId}, RequestId: {command.RequestId}");
 
         Task<BaseCommand>? responseTask;
 
@@ -141,6 +157,7 @@ public sealed class Connection : IConnection
     public async Task<BaseCommand> Send(CommandConnect command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandConnect:, ClientVersion: {command.ClientVersion}, ProtocolVersion: {command.ProtocolVersion}");
 
         if (_authentication is not null)
         {
@@ -163,6 +180,7 @@ public sealed class Connection : IConnection
     public async Task<BaseCommand> Send(CommandLookupTopic command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandLookupTopic: Topic: {command.Topic}, RequestId: {command.RequestId}");
 
         Task<BaseCommand>? responseTask;
 
@@ -179,6 +197,7 @@ public sealed class Connection : IConnection
     public async Task<BaseCommand> Send(CommandSeek command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandSeek: ConsumerId: {command.ConsumerId}, RequestId: {command.RequestId}");
 
         Task<BaseCommand>? responseTask;
 
@@ -227,6 +246,7 @@ public sealed class Connection : IConnection
     public async Task<BaseCommand> Send(CommandCloseConsumer command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandCloseConsumer: ConsumerId: {command.ConsumerId}, RequestId: {command.RequestId}");
 
         Task<BaseCommand>? responseTask;
 
@@ -267,6 +287,7 @@ public sealed class Connection : IConnection
     public async Task<BaseCommand> Send(CommandGetOrCreateSchema command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandGetOrCreateSchema: Topic: {command.Topic}, RequestId: {command.RequestId}");
 
         Task<BaseCommand>? responseTask;
 
@@ -283,6 +304,7 @@ public sealed class Connection : IConnection
     public async Task<BaseCommand> Send(CommandPartitionedTopicMetadata command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandPartitionedTopicMetadata:  Topic: {command.Topic}, RequestId: {command.RequestId}");
 
         Task<BaseCommand>? responseTask;
 
@@ -299,6 +321,7 @@ public sealed class Connection : IConnection
     public async Task<BaseCommand> Send(CommandGetTopicsOfNamespace command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        Console.WriteLine($"Connection send CommandGetTopicsOfNamespace: Namespace: {command.Namespace}, RequestId: {command.RequestId}");
 
         Task<BaseCommand>? responseTask;
 
@@ -315,6 +338,8 @@ public sealed class Connection : IConnection
     private async Task Send(BaseCommand command, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        if (command.CommandType != BaseCommand.Type.Pong)
+            Console.WriteLine($"Connection send command: {command.CommandType}");
 
         var sequence = Serializer.Serialize(command);
 
@@ -360,7 +385,15 @@ public sealed class Connection : IConnection
                 var command = Serializer.Deserialize<BaseCommand>(frame.Slice(4, commandSize));
 
                 _pingPongHandler.Incoming(command.CommandType);
+                if (command.CommandType != BaseCommand.Type.Ping)
+                {
+                    Console.WriteLine($"Incoming command: {command.CommandType}");
+                }
 
+                if (command.CommandType == BaseCommand.Type.Error)
+                {
+                    Console.WriteLine($"ERROR: {command.CommandType}, {command.Error.RequestId}, {command.Error.Message}, {command.Error.Error}");
+                }
                 if (command.CommandType == BaseCommand.Type.Message)
                     _channelManager.Incoming(command.Message, new ReadOnlySequence<byte>(frame.Slice(commandSize + 4).ToArray()));
                 else if (command.CommandType == BaseCommand.Type.AuthChallenge)

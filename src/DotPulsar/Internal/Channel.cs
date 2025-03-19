@@ -36,6 +36,7 @@ public sealed class Channel : IChannel
     {
         try
         {
+            Console.WriteLine($"Received message from channel {_correlationId}: {message.MessageId}");
             _enqueue.Enqueue(message);
         }
         catch

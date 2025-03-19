@@ -72,6 +72,7 @@ public sealed class ConsumerChannel<TMessage> : IConsumerChannel<TMessage>
 
     public async ValueTask<IMessage<TMessage>> Receive(CancellationToken cancellationToken)
     {
+        Console.WriteLine($"ConsumerChannel: Receiving {_topic}");
         using (await _lock.Lock(cancellationToken).ConfigureAwait(false))
         {
             while (true)
@@ -87,6 +88,7 @@ public sealed class ConsumerChannel<TMessage> : IConsumerChannel<TMessage>
                     return message;
 
                 var messagePackage = await _queue.Dequeue(cancellationToken).ConfigureAwait(false);
+                Console.WriteLine($"ConsumerChannel Received {messagePackage.MessageId} from {_topic}");
 
                 if (!messagePackage.ValidateMagicNumberAndChecksum())
                 {
